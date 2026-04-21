@@ -36,11 +36,13 @@ WINDOW_NAME = "Head Dodge Game"
 FULLSCREEN_WINDOW = False
 TARGET_FPS = 60
 TARGET_FRAME_TIME = 1.0 / TARGET_FPS
+AUTO_RESTART_ENABLED = True
+AUTO_RESTART_DELAY = 1.0
 JAB_BOX_WIDTH = 100
 JAB_BOX_HEIGHT = 100
 JAB_WARNING_DURATION = 0.75
 JAB_ACTIVE_DURATION = 0.18
-STRAIGHT_HEAD_GAP = 18
+STRAIGHT_SIDE_HEAD_OFFSET_RATIO = 0.25
 HOOK_WIDTH = 280
 HOOK_HEIGHT = 40
 HOOK_WARNING_DURATION = 0.35
@@ -306,12 +308,13 @@ def create_jab_attack(
     head_x, head_y, head_w, head_h = head_rect
     width = min(frame_w, JAB_BOX_WIDTH)
     height = min(frame_h, JAB_BOX_HEIGHT)
+    side_offset = int(head_w * STRAIGHT_SIDE_HEAD_OFFSET_RATIO)
     if side == "center":
         center_x = head_x + head_w // 2
     elif side == "left":
-        center_x = head_x - STRAIGHT_HEAD_GAP - width // 2
+        center_x = head_x + side_offset
     elif side == "right":
-        center_x = head_x + head_w + STRAIGHT_HEAD_GAP + width // 2
+        center_x = head_x + head_w - side_offset
     else:
         raise ValueError(f"Unsupported straight punch side: {side}")
     center_y = head_y + head_h // 2
@@ -689,12 +692,29 @@ def main() -> None:
     last_spawn_time = time.time()
     score = 0
     game_over = False
+    game_over_started_at: Optional[float] = None
     last_head_rect: Optional[Rect] = None
     last_arm_rects: List[Rect] = []
     last_arm_segments: List[ArmSegment] = []
     last_arm_seen_at = 0.0
     previous_gray: Optional[np.ndarray] = None
     previous_frame_time = time.perf_counter() - TARGET_FRAME_TIME
+
+    def reset_round(current_head_rect: Optional[Rect]) -> None:
+        nonlocal attacks, last_spawn_time, score, game_over, game_over_started_at
+        nonlocal last_head_rect, last_arm_rects, last_arm_segments, last_arm_seen_at, previous_gray
+
+        attacks = []
+        last_spawn_time = time.time()
+        score = 0
+        game_over = False
+        game_over_started_at = None
+        last_head_rect = current_head_rect
+        last_arm_rects = []
+        last_arm_segments = []
+        last_arm_seen_at = 0.0
+        previous_gray = None
+        mouse_state["restart_requested"] = False
 
     while True:
         frame_started_at = time.perf_counter()
@@ -767,6 +787,8 @@ def main() -> None:
 
                 if head_rect is not None and hit_rect is not None and intersects(head_rect, hit_rect):
                     game_over = True
+                    if game_over_started_at is None:
+                        game_over_started_at = now
 
                 if attack.is_finished(frame_w, frame_h):
                     score += 1
@@ -841,6 +863,17 @@ def main() -> None:
                 (0, 0, 255),
                 2,
             )
+            if AUTO_RESTART_ENABLED and game_over_started_at is not None:
+                restart_in = max(0.0, AUTO_RESTART_DELAY - (now - game_over_started_at))
+                cv2.putText(
+                    frame,
+                    f"Auto restart in {restart_in:.1f}s",
+                    (int(frame_w * 0.18), int(frame_h * 0.64)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2,
+                )
             cv2.rectangle(
                 frame,
                 (button_x, button_y),
@@ -875,17 +908,15 @@ def main() -> None:
             time.sleep(remaining_frame_time)
 
         key = cv2.waitKey(1) & 0xFF
+        if (
+            AUTO_RESTART_ENABLED
+            and game_over
+            and game_over_started_at is not None
+            and (now - game_over_started_at) >= AUTO_RESTART_DELAY
+        ):
+            mouse_state["restart_requested"] = True
         if mouse_state["restart_requested"]:
-            attacks = []
-            last_spawn_time = time.time()
-            score = 0
-            game_over = False
-            last_head_rect = head_rect
-            last_arm_rects = []
-            last_arm_segments = []
-            last_arm_seen_at = 0.0
-            previous_gray = None
-            mouse_state["restart_requested"] = False
+            reset_round(head_rect)
         if key == ord("q"):
             break
 
