@@ -38,11 +38,15 @@ TARGET_FPS = 60
 TARGET_FRAME_TIME = 1.0 / TARGET_FPS
 JAB_BOX_WIDTH = 100
 JAB_BOX_HEIGHT = 100
+JAB_WARNING_DURATION = 0.75
+JAB_ACTIVE_DURATION = 0.18
+STRAIGHT_HEAD_GAP = 18
 HOOK_WIDTH = 280
 HOOK_HEIGHT = 40
 HOOK_WARNING_DURATION = 0.35
 HOOK_WARNING_WIDTH = 100
 HOOK_WARNING_HEAD_GAP = 18
+COMBO_STEP_DELAY = 0.38
 ARM_BLOCK_PADDING = 20
 ARM_DRAW_THICKNESS = 6
 ARM_GUARD_TOP_MULTIPLIER = 0.7
@@ -106,17 +110,27 @@ class JabAttack(Attack):
         warning_duration: float,
         active_duration: float,
         start_time: float,
+        label: str = "JAB",
     ):
         self.rect = (x, y, width, height)
         self.warning_duration = warning_duration
         self.active_duration = active_duration
-        self.state = "warning"
-        self.state_started_at = start_time
+        self.activation_time = start_time
+        self.label = label
+        self.state = "queued"
+        self.state_started_at = 0.0
         self.finished = False
 
     def update(self, now: float, delta_time: float) -> None:
         del delta_time
         if self.finished:
+            return
+
+        if self.state == "queued":
+            if now < self.activation_time:
+                return
+            self.state = "warning"
+            self.state_started_at = now
             return
 
         elapsed = now - self.state_started_at
@@ -127,6 +141,9 @@ class JabAttack(Attack):
             self.finished = True
 
     def draw(self, frame, now: float) -> None:
+        if self.state == "queued":
+            return
+
         x, y, w, h = self.rect
         overlay = frame.copy()
 
@@ -138,7 +155,7 @@ class JabAttack(Attack):
             remaining = max(0.0, self.warning_duration - (now - self.state_started_at))
             cv2.putText(
                 frame,
-                f"JAB IN {remaining:.1f}",
+                f"{self.label} IN {remaining:.1f}",
                 (x, max(30, y - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -166,6 +183,8 @@ class JabAttack(Attack):
 
     def is_finished(self, frame_w: int, frame_h: int) -> bool:
         del frame_w, frame_h
+        if self.state == "queued":
+            return False
         return self.finished
 
 
@@ -190,9 +209,10 @@ class HookAttack(Attack):
         self.frame_w = frame_w
         self.y = y
         self.warning_rect = warning_rect
+        self.activation_time = start_time
         self.warning_duration = warning_duration
-        self.state = "warning"
-        self.state_started_at = start_time
+        self.state = "queued"
+        self.state_started_at = 0.0
 
         if spawn_side == "left":
             self.x = -width
@@ -204,6 +224,13 @@ class HookAttack(Attack):
             raise ValueError(f"Unsupported side: {spawn_side}")
 
     def update(self, now: float, delta_time: float) -> None:
+        if self.state == "queued":
+            if now < self.activation_time:
+                return
+            self.state = "warning"
+            self.state_started_at = now
+            return
+
         if self.state == "warning":
             if now - self.state_started_at >= self.warning_duration:
                 self.state = "strike"
@@ -213,6 +240,9 @@ class HookAttack(Attack):
         self.x += self.vx * delta_time
 
     def draw(self, frame, now: float) -> None:
+        if self.state == "queued":
+            return
+
         if self.state == "warning":
             x, y, w, h = self.get_warning_rect()
         else:
@@ -259,17 +289,31 @@ class HookAttack(Attack):
 
     def is_finished(self, frame_w: int, frame_h: int) -> bool:
         del frame_h
-        if self.state != "strike":
+        if self.state in {"queued", "warning"}:
             return False
         return self.x + self.width < 0 or self.x > frame_w
 
 
-def create_jab_attack(head_rect: Rect, frame_w: int, frame_h: int, start_time: float) -> JabAttack:
-    """Create a telegraphed jab centered on the player's current head position."""
+def create_jab_attack(
+    head_rect: Rect,
+    frame_w: int,
+    frame_h: int,
+    start_time: float,
+    side: str = "center",
+    label: str = "JAB",
+) -> JabAttack:
+    """Create a telegraphed straight punch near the player's current head position."""
     head_x, head_y, head_w, head_h = head_rect
     width = min(frame_w, JAB_BOX_WIDTH)
     height = min(frame_h, JAB_BOX_HEIGHT)
-    center_x = head_x + head_w // 2
+    if side == "center":
+        center_x = head_x + head_w // 2
+    elif side == "left":
+        center_x = head_x - STRAIGHT_HEAD_GAP - width // 2
+    elif side == "right":
+        center_x = head_x + head_w + STRAIGHT_HEAD_GAP + width // 2
+    else:
+        raise ValueError(f"Unsupported straight punch side: {side}")
     center_y = head_y + head_h // 2
     x = max(0, min(frame_w - width, center_x - width // 2))
     y = max(0, min(frame_h - height, center_y - height // 2))
@@ -279,13 +323,20 @@ def create_jab_attack(head_rect: Rect, frame_w: int, frame_h: int, start_time: f
         y=y,
         width=width,
         height=height,
-        warning_duration=0.75,
-        active_duration=0.18,
+        warning_duration=JAB_WARNING_DURATION,
+        active_duration=JAB_ACTIVE_DURATION,
         start_time=start_time,
+        label=label,
     )
 
 
-def create_hook_attack(head_rect: Rect, frame_w: int, frame_h: int, start_time: float) -> HookAttack:
+def create_hook_attack(
+    head_rect: Rect,
+    frame_w: int,
+    frame_h: int,
+    start_time: float,
+    spawn_side: Optional[str] = None,
+) -> HookAttack:
     """Create a telegraphed horizontal hook aimed at the player's current head level."""
     head_x, head_y, head_w, head_h = head_rect
     width = min(frame_w, HOOK_WIDTH)
@@ -294,7 +345,7 @@ def create_hook_attack(head_rect: Rect, frame_w: int, frame_h: int, start_time: 
     head_center_y = head_y + head_h // 2
     y = max(0, min(frame_h - height, head_center_y - height // 2))
     speed = random.uniform(max(frame_w, frame_h) * 1.8, max(frame_w, frame_h) * 2.1)
-    spawn_side = random.choice(["left", "right"])
+    spawn_side = spawn_side or random.choice(["left", "right"])
 
     if spawn_side == "left":
         warning_x = head_x - warning_width - HOOK_WARNING_HEAD_GAP
@@ -314,6 +365,54 @@ def create_hook_attack(head_rect: Rect, frame_w: int, frame_h: int, start_time: 
         warning_duration=HOOK_WARNING_DURATION,
         start_time=start_time,
     )
+
+
+def create_one_two_combo(head_rect: Rect, frame_w: int, frame_h: int, start_time: float) -> List[Attack]:
+    """Create a 1-2 combo: jab on the right side of the head, then cross on the left."""
+    return [
+        create_jab_attack(
+            head_rect,
+            frame_w,
+            frame_h,
+            start_time=start_time,
+            side="right",
+            label="JAB",
+        ),
+        create_jab_attack(
+            head_rect,
+            frame_w,
+            frame_h,
+            start_time=start_time + COMBO_STEP_DELAY,
+            side="left",
+            label="CROSS",
+        ),
+    ]
+
+
+def create_one_two_three_combo(head_rect: Rect, frame_w: int, frame_h: int, start_time: float) -> List[Attack]:
+    """Create a 1-2-3 combo: jab, cross, then a left hook."""
+    return [
+        *create_one_two_combo(head_rect, frame_w, frame_h, start_time),
+        create_hook_attack(
+            head_rect,
+            frame_w,
+            frame_h,
+            start_time=start_time + COMBO_STEP_DELAY * 2,
+            spawn_side="left",
+        ),
+    ]
+
+
+def create_attack_pattern(head_rect: Rect, frame_w: int, frame_h: int, start_time: float) -> List[Attack]:
+    """Create either a single punch or a short combo sequence."""
+    pattern_roll = random.random()
+    if pattern_roll < 0.35:
+        return [create_jab_attack(head_rect, frame_w, frame_h, start_time)]
+    if pattern_roll < 0.55:
+        return [create_hook_attack(head_rect, frame_w, frame_h, start_time)]
+    if pattern_roll < 0.8:
+        return create_one_two_combo(head_rect, frame_w, frame_h, start_time)
+    return create_one_two_three_combo(head_rect, frame_w, frame_h, start_time)
 
 
 def intersects(rect1: Rect, rect2: Rect) -> bool:
@@ -653,10 +752,7 @@ def main() -> None:
                 last_arm_segments = []
 
         if not game_over and target_head_rect is not None and (now - last_spawn_time > spawn_interval):
-            if random.random() < 0.55:
-                attacks.append(create_jab_attack(target_head_rect, frame_w, frame_h, now))
-            else:
-                attacks.append(create_hook_attack(target_head_rect, frame_w, frame_h, now))
+            attacks.extend(create_attack_pattern(target_head_rect, frame_w, frame_h, now))
             last_spawn_time = now
 
         if not game_over:
@@ -701,7 +797,7 @@ def main() -> None:
         )
         cv2.putText(
             frame,
-            "Yellow = jab/hook warning | Orange = live hook | Cyan guard blocks hooks",
+            "Yellow = punch warning | Orange = live hook | Cyan guard blocks hooks",
             (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
