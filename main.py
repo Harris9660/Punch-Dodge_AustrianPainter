@@ -2,6 +2,7 @@ import os
 import math
 import random
 import sys
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -38,6 +39,19 @@ WINDOW_NAME = "Head Dodge Game"
 FULLSCREEN_WINDOW = True
 TARGET_FPS = 60
 TARGET_FRAME_TIME = 1.0 / TARGET_FPS
+SHOW_FPS_COUNTER = True
+SHOW_PERFORMANCE_BREAKDOWN = True
+SHOW_CAMERA_STATS = True
+FPS_SMOOTHING = 0.12
+CAMERA_BUFFER_SIZE = 1
+CAMERA_USE_MJPG = True
+CAMERA_FRAME_WIDTH = 1280
+CAMERA_FRAME_HEIGHT = 720
+FACE_DETECTION_SCALE = 0.6
+FACE_DETECTION_EVERY_N_FRAMES = 1
+FACE_SEARCH_SCALE = 2.5
+POSE_INPUT_SCALE = 0.75
+POSE_DETECTION_EVERY_N_FRAMES = 2
 AUTO_RESTART_ENABLED = True
 AUTO_RESTART_DELAY = 1.0
 # "pad_work", "dodge", "both"
@@ -61,6 +75,8 @@ COMBO_STEP_DELAY = 0.38
 ARM_BLOCK_LENGTH_PADDING = 24
 ARM_BLOCK_THICKNESS = 56
 ARM_DRAW_THICKNESS = 8
+FACE_MEMORY_SECONDS = 0.35
+FACE_SMOOTHING = 1.0  # 1.0 means no smoothing; use the latest face box immediately.
 ARM_GUARD_TOP_MULTIPLIER = 0.7
 ARM_GUARD_BOTTOM_MULTIPLIER = 1.0
 ARM_MEMORY_SECONDS = 0.12
@@ -194,12 +210,10 @@ class JabAttack(Attack):
             return
 
         cx, cy = self.center
-        overlay = frame.copy()
 
         if self.state == "warning":
             radius = self.get_current_radius(now)
-            cv2.circle(overlay, self.center, radius, (0, 215, 255), -1)
-            cv2.addWeighted(overlay, 0.22, frame, 0.78, 0, frame)
+            blend_circle(frame, self.center, radius, (0, 215, 255), 0.22)
             cv2.circle(frame, self.center, radius, (0, 215, 255), 3)
             cv2.circle(frame, self.center, max(5, radius // 4), (0, 215, 255), -1)
 
@@ -214,8 +228,7 @@ class JabAttack(Attack):
                 2,
             )
         else:
-            cv2.circle(overlay, self.center, self.strike_radius, (0, 0, 255), -1)
-            cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+            blend_circle(frame, self.center, self.strike_radius, (0, 0, 255), 0.45)
             cv2.circle(frame, self.center, self.strike_radius, (0, 0, 255), 3)
             cv2.circle(frame, self.center, max(5, self.strike_radius // 4), (0, 0, 255), -1)
             cv2.putText(
@@ -305,10 +318,8 @@ class HookAttack(Attack):
                 return
             x, y, w, h = hit_rect
 
-        overlay = frame.copy()
         if self.state == "warning":
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 215, 255), -1)
-            cv2.addWeighted(overlay, 0.22, frame, 0.78, 0, frame)
+            blend_rect(frame, (x, y, w, h), (0, 215, 255), 0.22)
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 3)
             remaining = max(0.0, self.warning_duration - (now - self.state_started_at))
             direction_label = "HOOK ->" if self.spawn_side == "left" else "HOOK <-"
@@ -316,8 +327,7 @@ class HookAttack(Attack):
             label_x = max(10, min(x + 8, frame.shape[1] - 180))
             label_color = (0, 215, 255)
         else:
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 120, 255), -1)
-            cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+            blend_rect(frame, (x, y, w, h), (0, 120, 255), 0.4)
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 120, 255), 3)
             label = "HOOK"
             label_x = max(10, min(x, frame.shape[1] - 90))
@@ -387,9 +397,7 @@ class PadTarget:
         pad_color = (255, 0, 0) if ready else (0, 215, 255)
         cx, cy = self.center
 
-        overlay = frame.copy()
-        cv2.circle(overlay, self.center, current_radius, pad_color, -1)
-        cv2.addWeighted(overlay, 0.22 if ready else 0.16, frame, 0.78 if ready else 0.84, 0, frame)
+        blend_circle(frame, self.center, current_radius, pad_color, 0.22 if ready else 0.16)
         cv2.circle(frame, self.center, current_radius, pad_color, 3)
         cv2.circle(frame, self.center, max(5, current_radius // 4), pad_color, -1)
 
@@ -584,6 +592,18 @@ def rect_center(rect: Rect) -> Point:
     return x + w // 2, y + h // 2
 
 
+def smooth_rect(previous_rect: Rect, current_rect: Rect, smoothing: float) -> Rect:
+    """Blend face boxes so the tracked head rectangle feels stable."""
+    smoothing = max(0.0, min(1.0, smoothing))
+    inverse = 1.0 - smoothing
+    return (
+        int(round(previous_rect[0] * inverse + current_rect[0] * smoothing)),
+        int(round(previous_rect[1] * inverse + current_rect[1] * smoothing)),
+        int(round(previous_rect[2] * inverse + current_rect[2] * smoothing)),
+        int(round(previous_rect[3] * inverse + current_rect[3] * smoothing)),
+    )
+
+
 def clamp_rect(x: int, y: int, width: int, height: int, frame_w: int, frame_h: int) -> Rect:
     """Clamp a rectangle to remain inside the frame."""
     x = max(0, min(frame_w - 1, x))
@@ -591,6 +611,113 @@ def clamp_rect(x: int, y: int, width: int, height: int, frame_w: int, frame_h: i
     width = max(1, min(width, frame_w - x))
     height = max(1, min(height, frame_h - y))
     return x, y, width, height
+
+
+def blend_rect(frame, rect: Rect, color: Tuple[int, int, int], alpha: float) -> None:
+    """Blend a rectangle into only the affected pixels."""
+    frame_h, frame_w = frame.shape[:2]
+    x, y, width, height = clamp_rect(*rect, frame_w, frame_h)
+    roi = frame[y : y + height, x : x + width]
+    overlay = roi.copy()
+    overlay[:] = color
+    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, roi)
+
+
+def blend_circle(frame, center: Point, radius: int, color: Tuple[int, int, int], alpha: float) -> None:
+    """Blend a circle into only the affected pixels."""
+    if radius <= 0:
+        return
+
+    frame_h, frame_w = frame.shape[:2]
+    x, y, width, height = clamp_rect(
+        center[0] - radius,
+        center[1] - radius,
+        radius * 2,
+        radius * 2,
+        frame_w,
+        frame_h,
+    )
+    roi = frame[y : y + height, x : x + width]
+    overlay = roi.copy()
+    cv2.circle(overlay, (center[0] - x, center[1] - y), radius, color, -1)
+    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, roi)
+
+
+def smooth_metric(previous_value: float, current_value: float, smoothing: float) -> float:
+    """Smooth noisy on-screen timing metrics."""
+    if previous_value <= 0.0:
+        return current_value
+    return previous_value * (1.0 - smoothing) + current_value * smoothing
+
+
+class LatestFrameCapture:
+    """Continuously read camera frames so the game loop does not block on capture."""
+
+    def __init__(self, capture, initial_frame) -> None:
+        self.capture = capture
+        self.latest_frame = initial_frame
+        self.latest_frame_id = 0
+        self.latest_read_ms = 0.0
+        self.live_fps = 0.0
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._last_frame_at = time.perf_counter()
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def read_latest(self):
+        """Return the newest captured frame plus camera timing information."""
+        with self._lock:
+            return self.latest_frame, self.latest_frame_id, self.latest_read_ms, self.live_fps
+
+    def _reader_loop(self) -> None:
+        while self._running:
+            read_started_at = time.perf_counter()
+            ret, frame = self.capture.read()
+            read_finished_at = time.perf_counter()
+            if not ret:
+                time.sleep(0.001)
+                continue
+
+            read_elapsed_ms = (read_finished_at - read_started_at) * 1000.0
+            current_live_fps = 0.0
+            frame_interval = read_finished_at - self._last_frame_at
+            if frame_interval > 0.0:
+                current_live_fps = 1.0 / frame_interval
+            self._last_frame_at = read_finished_at
+
+            with self._lock:
+                self.latest_frame = frame
+                self.latest_frame_id += 1
+                self.latest_read_ms = read_elapsed_ms
+                if current_live_fps > 0.0:
+                    self.live_fps = smooth_metric(self.live_fps, current_live_fps, 0.15)
+
+
+def get_face_search_rect(head_rect: Rect, frame_w: int, frame_h: int) -> Rect:
+    """Expand the previous face box into a search window for the next detection."""
+    center_x, center_y = rect_center(head_rect)
+    search_width = max(head_rect[2], int(round(head_rect[2] * FACE_SEARCH_SCALE)))
+    search_height = max(head_rect[3], int(round(head_rect[3] * FACE_SEARCH_SCALE)))
+    return clamp_rect(
+        center_x - search_width // 2,
+        center_y - search_height // 2,
+        search_width,
+        search_height,
+        frame_w,
+        frame_h,
+    )
 
 
 def get_arm_search_rects(head_rect: Rect, frame_w: int, frame_h: int) -> List[Rect]:
@@ -820,6 +947,12 @@ def main() -> None:
     if not cap.isOpened():
         print("Error: Unable to access webcam.")
         return
+    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
+    if CAMERA_USE_MJPG and hasattr(cv2, "VideoWriter_fourcc"):
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
 
     ret, frame = cap.read()
@@ -827,6 +960,11 @@ def main() -> None:
         print("Error: Unable to read from webcam.")
         return
     frame_h, frame_w = frame.shape[:2]
+    capture_stream = LatestFrameCapture(cap, frame)
+    capture_stream.start()
+    camera_reported_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    camera_reported_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    camera_reported_fps = cap.get(cv2.CAP_PROP_FPS)
 
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     face_cascade = cv2.CascadeClassifier(cascade_path)
@@ -892,11 +1030,20 @@ def main() -> None:
     game_over = False
     game_over_started_at: Optional[float] = None
     last_head_rect: Optional[Rect] = None
+    last_head_seen_at = 0.0
     last_arm_rects: List[Rect] = []
     last_arm_segments: List[ArmSegment] = []
     last_arm_seen_at = 0.0
+    last_pose_results = None
     previous_gray: Optional[np.ndarray] = None
     previous_frame_time = time.perf_counter() - TARGET_FRAME_TIME
+    last_capture_frame_id = -1
+    fps_display = float(TARGET_FPS)
+    frame_ms_display = 0.0
+    read_ms_display = 0.0
+    pose_ms_display = 0.0
+    face_ms_display = 0.0
+    live_camera_fps_display = 0.0
 
     def clear_stage_elements(started_at: float) -> None:
         nonlocal attacks, pad_target, next_pad_spawn_time, last_spawn_time
@@ -908,7 +1055,8 @@ def main() -> None:
 
     def reset_round(current_head_rect: Optional[Rect]) -> None:
         nonlocal score, game_over, game_over_started_at, current_stage, stage_started_at
-        nonlocal last_head_rect, last_arm_rects, last_arm_segments, last_arm_seen_at, previous_gray
+        nonlocal last_head_rect, last_head_seen_at, last_arm_rects, last_arm_segments, last_arm_seen_at
+        nonlocal last_pose_results, previous_gray
 
         current_stage = "dodge" if game_mode == "both" else game_mode
         stage_started_at = time.time()
@@ -917,9 +1065,11 @@ def main() -> None:
         game_over = False
         game_over_started_at = None
         last_head_rect = current_head_rect
+        last_head_seen_at = time.time() if current_head_rect is not None else 0.0
         last_arm_rects = []
         last_arm_segments = []
         last_arm_seen_at = 0.0
+        last_pose_results = None
         previous_gray = None
         mouse_state["restart_requested"] = False
 
@@ -927,15 +1077,25 @@ def main() -> None:
         frame_started_at = time.perf_counter()
         delta_time = frame_started_at - previous_frame_time
         previous_frame_time = frame_started_at
+        fps_display = smooth_metric(
+            fps_display,
+            (1.0 / delta_time) if delta_time > 0.0 else 0.0,
+            FPS_SMOOTHING,
+        )
 
-        ret, frame = cap.read()
-        if not ret:
+        frame, capture_frame_id, capture_read_ms, live_camera_fps = capture_stream.read_latest()
+        if frame is None:
             break
+        has_new_camera_frame = capture_frame_id != last_capture_frame_id
+        if has_new_camera_frame:
+            last_capture_frame_id = capture_frame_id
 
         now = time.time()
         frame = cv2.flip(frame, 1)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        read_elapsed = capture_read_ms / 1000.0
+        if live_camera_fps > 0.0:
+            live_camera_fps_display = smooth_metric(live_camera_fps_display, live_camera_fps, FPS_SMOOTHING)
 
         if game_mode == "both" and not game_over and (now - stage_started_at) >= BOTH_MODE_STAGE_DURATION:
             current_stage = "pad_work" if current_stage == "dodge" else "dodge"
@@ -945,23 +1105,108 @@ def main() -> None:
         pad_work_enabled = mode_has_pad_work(current_stage)
         dodge_enabled = mode_has_dodge(current_stage)
 
-        pose_results = None
-        if pose_tracker is not None:
+        face_elapsed = 0.0
+        largest_face = None
+        if has_new_camera_frame and (capture_frame_id % max(1, FACE_DETECTION_EVERY_N_FRAMES)) == 0:
+            face_input = gray
+            if FACE_DETECTION_SCALE != 1.0:
+                face_input = cv2.resize(
+                    gray,
+                    None,
+                    fx=FACE_DETECTION_SCALE,
+                    fy=FACE_DETECTION_SCALE,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+            search_rect = None
+            if last_head_rect is not None:
+                search_rect = get_face_search_rect(
+                    (
+                        int(round(last_head_rect[0] * FACE_DETECTION_SCALE)),
+                        int(round(last_head_rect[1] * FACE_DETECTION_SCALE)),
+                        max(1, int(round(last_head_rect[2] * FACE_DETECTION_SCALE))),
+                        max(1, int(round(last_head_rect[3] * FACE_DETECTION_SCALE))),
+                    ) if FACE_DETECTION_SCALE != 1.0 else last_head_rect,
+                    face_input.shape[1],
+                    face_input.shape[0],
+                )
+
+            face_started_at = time.perf_counter()
+            if search_rect is not None:
+                search_x, search_y, search_w, search_h = search_rect
+                search_roi = face_input[search_y : search_y + search_h, search_x : search_x + search_w]
+                local_faces = face_cascade.detectMultiScale(search_roi, scaleFactor=1.3, minNeighbors=5)
+                if len(local_faces) > 0:
+                    local_largest_face = max(local_faces, key=lambda face: face[2] * face[3])
+                    largest_face = (
+                        int(local_largest_face[0] + search_x),
+                        int(local_largest_face[1] + search_y),
+                        int(local_largest_face[2]),
+                        int(local_largest_face[3]),
+                    )
+
+            if largest_face is None:
+                faces = face_cascade.detectMultiScale(face_input, scaleFactor=1.3, minNeighbors=5)
+                if len(faces) > 0:
+                    largest_face = max(faces, key=lambda face: face[2] * face[3])
+            face_elapsed = time.perf_counter() - face_started_at
+
+        head_rect: Optional[Rect] = None
+        if largest_face is not None:
+            if FACE_DETECTION_SCALE != 1.0:
+                scale = 1.0 / FACE_DETECTION_SCALE
+                head_rect = (
+                    int(round(largest_face[0] * scale)),
+                    int(round(largest_face[1] * scale)),
+                    int(round(largest_face[2] * scale)),
+                    int(round(largest_face[3] * scale)),
+                )
+            else:
+                head_rect = tuple(int(value) for value in largest_face)
+            head_rect = clamp_rect(*head_rect, frame_w, frame_h)
+            if last_head_rect is None:
+                last_head_rect = head_rect
+            else:
+                last_head_rect = smooth_rect(last_head_rect, head_rect, FACE_SMOOTHING)
+            last_head_seen_at = now
+        elif last_head_rect is not None and (now - last_head_seen_at) > FACE_MEMORY_SECONDS:
+            last_head_rect = None
+
+        target_head_rect = last_head_rect
+        pose_results = last_pose_results
+        pose_elapsed = 0.0
+        if (
+            pose_tracker is not None
+            and target_head_rect is not None
+            and has_new_camera_frame
+            and (
+                last_pose_results is None
+                or (capture_frame_id % max(1, POSE_DETECTION_EVERY_N_FRAMES)) == 0
+            )
+        ):
+            pose_input_frame = frame
+            if POSE_INPUT_SCALE != 1.0:
+                pose_input_frame = cv2.resize(
+                    frame,
+                    None,
+                    fx=POSE_INPUT_SCALE,
+                    fy=POSE_INPUT_SCALE,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            pose_rgb_frame = cv2.cvtColor(pose_input_frame, cv2.COLOR_BGR2RGB)
+            pose_started_at = time.perf_counter()
             if pose_tracker_backend == "solutions":
-                pose_results = pose_tracker.process(rgb_frame)
+                pose_results = pose_tracker.process(pose_rgb_frame)
             elif pose_tracker_backend == "tasks":
                 frame_timestamp_ms = int(frame_started_at * 1000)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=pose_rgb_frame)
                 pose_results = pose_tracker.detect_for_video(mp_image, frame_timestamp_ms)
+            pose_elapsed = time.perf_counter() - pose_started_at
+            last_pose_results = pose_results
+        elif target_head_rect is None:
+            pose_results = None
+            last_pose_results = None
 
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
-        head_rect: Optional[Rect] = None
-        if len(faces) > 0:
-            largest_face = max(faces, key=lambda f: f[2] * f[3])
-            head_rect = tuple(int(value) for value in largest_face)
-            last_head_rect = head_rect
-
-        target_head_rect = head_rect if head_rect is not None else last_head_rect
         arm_rects: List[Rect] = []
         arm_segments: List[ArmSegment] = []
         if target_head_rect is not None:
@@ -1010,7 +1255,7 @@ def main() -> None:
                     if any(intersects(arm_rect, hit_rect) for arm_rect in arm_rects):
                         continue
 
-                if head_rect is not None and hit_rect is not None and intersects(head_rect, hit_rect):
+                if target_head_rect is not None and hit_rect is not None and intersects(target_head_rect, hit_rect):
                     game_over = True
                     if game_over_started_at is None:
                         game_over_started_at = now
@@ -1036,8 +1281,8 @@ def main() -> None:
                 pad_target = None
                 next_pad_spawn_time = now + PAD_RESPAWN_DELAY
 
-        if head_rect is not None:
-            x, y, w, h = head_rect
+        if target_head_rect is not None:
+            x, y, w, h = target_head_rect
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
         for arm_start, arm_end in arm_segments:
@@ -1110,6 +1355,26 @@ def main() -> None:
                 (0, 0, 255),
                 2,
             )
+        if SHOW_FPS_COUNTER:
+            cv2.putText(
+                frame,
+                f"FPS: {fps_display:.1f}",
+                (max(10, frame_w - 170), 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+            )
+        if SHOW_CAMERA_STATS:
+            cv2.putText(
+                frame,
+                f"Cam {camera_reported_width}x{camera_reported_height} @ {camera_reported_fps:.1f} live {live_camera_fps_display:.1f}",
+                (max(10, frame_w - 320), 58),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (220, 220, 220),
+                2,
+            )
 
         if dodge_enabled and game_over:
             button_width = int(frame_w * 0.24)
@@ -1174,9 +1439,24 @@ def main() -> None:
         else:
             mouse_state["restart_button_rect"] = None
 
+        frame_elapsed = time.perf_counter() - frame_started_at
+        frame_ms_display = smooth_metric(frame_ms_display, frame_elapsed * 1000.0, FPS_SMOOTHING)
+        read_ms_display = smooth_metric(read_ms_display, read_elapsed * 1000.0, FPS_SMOOTHING)
+        pose_ms_display = smooth_metric(pose_ms_display, pose_elapsed * 1000.0, FPS_SMOOTHING)
+        face_ms_display = smooth_metric(face_ms_display, face_elapsed * 1000.0, FPS_SMOOTHING)
+        if SHOW_PERFORMANCE_BREAKDOWN:
+            cv2.putText(
+                frame,
+                f"Frame {frame_ms_display:.1f}ms | Read {read_ms_display:.1f} | Pose {pose_ms_display:.1f} | Face {face_ms_display:.1f}",
+                (10, frame_h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+            )
+
         cv2.imshow(WINDOW_NAME, frame)
 
-        frame_elapsed = time.perf_counter() - frame_started_at
         remaining_frame_time = TARGET_FRAME_TIME - frame_elapsed
         if remaining_frame_time > 0:
             time.sleep(remaining_frame_time)
@@ -1192,12 +1472,13 @@ def main() -> None:
         ):
             mouse_state["restart_requested"] = True
         if mouse_state["restart_requested"]:
-            reset_round(head_rect)
+            reset_round(target_head_rect)
         if key == ord("q"):
             break
 
         previous_gray = cv2.GaussianBlur(gray, (7, 7), 0)
 
+    capture_stream.stop()
     cap.release()
     if pose_tracker is not None:
         pose_tracker.close()
