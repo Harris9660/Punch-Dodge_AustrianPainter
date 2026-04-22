@@ -32,12 +32,24 @@ except Exception:
 Rect = Tuple[int, int, int, int]
 Point = Tuple[int, int]
 ArmSegment = Tuple[Point, Point]
+
+
 WINDOW_NAME = "Head Dodge Game"
 FULLSCREEN_WINDOW = False
 TARGET_FPS = 60
 TARGET_FRAME_TIME = 1.0 / TARGET_FPS
 AUTO_RESTART_ENABLED = True
 AUTO_RESTART_DELAY = 1.0
+# "pad_work", "dodge", "both"
+GAME_MODE = "both"
+BOTH_MODE_STAGE_DURATION = 10.0
+PAD_SCORE_POINTS = 2
+PAD_RESPAWN_DELAY = 0.7
+PAD_START_RADIUS = 12
+PAD_READY_RADIUS = 42
+PAD_GROW_DURATION = 0.45
+PAD_READY_WINDOW = 1.0
+PAD_HEAD_SIDE_OFFSET_RATIO = 0.5
 JAB_BOX_WIDTH = 100
 JAB_BOX_HEIGHT = 100
 JAB_WARNING_DURATION = 0.75
@@ -82,6 +94,33 @@ if MEDIAPIPE_SOLUTIONS_AVAILABLE:
     POSE_LANDMARK = mp.solutions.pose.PoseLandmark
 elif MEDIAPIPE_TASKS_AVAILABLE:
     POSE_LANDMARK = mp_vision.PoseLandmark
+
+
+def normalize_game_mode(game_mode: str) -> str:
+    """Validate and normalize the selected game mode."""
+    normalized_mode = game_mode.strip().lower()
+    if normalized_mode not in {"pad_work", "dodge", "both"}:
+        raise ValueError("GAME_MODE must be 'pad_work', 'dodge', or 'both'.")
+    return normalized_mode
+
+
+def mode_has_pad_work(game_mode: str) -> bool:
+    """Check whether the selected mode includes pad work."""
+    return game_mode in {"pad_work", "both"}
+
+
+def mode_has_dodge(game_mode: str) -> bool:
+    """Check whether the selected mode includes dodge attacks."""
+    return game_mode in {"dodge", "both"}
+
+
+def get_mode_label(game_mode: str) -> str:
+    """Create a readable label for the selected mode."""
+    return {
+        "pad_work": "Pad Work",
+        "dodge": "Dodge",
+        "both": "Both",
+    }[game_mode]
 
 
 class Attack:
@@ -296,6 +335,76 @@ class HookAttack(Attack):
         return self.x + self.width < 0 or self.x > frame_w
 
 
+class PadTarget:
+    """A timed pad target that grows, becomes live, then expires if not hit."""
+
+    def __init__(
+        self,
+        center: Point,
+        start_radius: int,
+        ready_radius: int,
+        grow_duration: float,
+        ready_window: float,
+        spawned_at: float,
+    ):
+        self.center = center
+        self.start_radius = start_radius
+        self.ready_radius = ready_radius
+        self.grow_duration = grow_duration
+        self.ready_window = ready_window
+        self.spawned_at = spawned_at
+
+    def get_current_radius(self, now: float) -> int:
+        elapsed = max(0.0, now - self.spawned_at)
+        if elapsed >= self.grow_duration:
+            return self.ready_radius
+        progress = elapsed / max(self.grow_duration, 0.001)
+        radius = self.start_radius + (self.ready_radius - self.start_radius) * progress
+        return int(round(radius))
+
+    def is_ready(self, now: float) -> bool:
+        return (now - self.spawned_at) >= self.grow_duration
+
+    def is_expired(self, now: float) -> bool:
+        return (now - self.spawned_at) >= (self.grow_duration + self.ready_window)
+
+    def draw(self, frame, now: float) -> None:
+        current_radius = self.get_current_radius(now)
+        ready = self.is_ready(now)
+        pad_color = (255, 0, 0) if ready else (0, 215, 255)
+        cx, cy = self.center
+
+        overlay = frame.copy()
+        cv2.circle(overlay, self.center, current_radius, pad_color, -1)
+        cv2.addWeighted(overlay, 0.22 if ready else 0.16, frame, 0.78 if ready else 0.84, 0, frame)
+        cv2.circle(frame, self.center, current_radius, pad_color, 3)
+        cv2.circle(frame, self.center, max(5, current_radius // 4), pad_color, -1)
+
+        label_y = max(30, cy - self.ready_radius - 12)
+        label_x = max(10, min(cx - 70, frame.shape[1] - 180))
+        cv2.putText(
+            frame,
+            "PAD",
+            (label_x, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            pad_color,
+            2,
+        )
+
+        if ready:
+            remaining = max(0.0, self.ready_window - (now - self.spawned_at - self.grow_duration))
+            cv2.putText(
+                frame,
+                f"HIT {remaining:.1f}",
+                (label_x, label_y + 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                pad_color,
+                2,
+            )
+
+
 def create_jab_attack(
     head_rect: Rect,
     frame_w: int,
@@ -401,7 +510,7 @@ def create_one_two_three_combo(head_rect: Rect, frame_w: int, frame_h: int, star
             frame_w,
             frame_h,
             start_time=start_time + COMBO_STEP_DELAY * 2,
-            spawn_side="left",
+            spawn_side="right",
         ),
     ]
 
@@ -434,6 +543,34 @@ def point_in_rect(x: int, y: int, rect: Rect) -> bool:
     """Check whether a point is inside a rectangle."""
     rect_x, rect_y, rect_w, rect_h = rect
     return rect_x <= x <= rect_x + rect_w and rect_y <= y <= rect_y + rect_h
+
+
+def point_distance(point1: Point, point2: Point) -> float:
+    """Measure the 2D distance between two points."""
+    return math.hypot(point1[0] - point2[0], point1[1] - point2[1])
+
+
+def segment_hits_circle(start: Point, end: Point, center: Point, radius: float) -> bool:
+    """Check whether a line segment intersects a circle."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared == 0:
+        return point_distance(start, center) <= radius
+
+    t = ((center[0] - start[0]) * dx + (center[1] - start[1]) * dy) / length_squared
+    t = max(0.0, min(1.0, t))
+    closest_point = (
+        start[0] + dx * t,
+        start[1] + dy * t,
+    )
+    return math.hypot(closest_point[0] - center[0], closest_point[1] - center[1]) <= radius
+
+
+def rect_center(rect: Rect) -> Point:
+    """Return the center point of a rectangle."""
+    x, y, w, h = rect
+    return x + w // 2, y + h // 2
 
 
 def clamp_rect(x: int, y: int, width: int, height: int, frame_w: int, frame_h: int) -> Rect:
@@ -618,8 +755,33 @@ def detect_arm_blocks_fallback(
     return arm_rects, arm_segments
 
 
+def create_pad_target(head_rect: Rect, frame_w: int, frame_h: int, spawned_at: float) -> PadTarget:
+    """Create a timed pad-work target near head height at a reachable striking distance."""
+    head_center_x, head_center_y = rect_center(head_rect)
+    head_w = head_rect[2]
+    side_offset = int(head_w * PAD_HEAD_SIDE_OFFSET_RATIO)
+    side = random.choice(["left", "right"])
+    center_x = head_rect[0] - side_offset if side == "left" else head_rect[0] + head_w + side_offset
+    center_y = head_center_y
+
+    center_x = max(PAD_READY_RADIUS + 10, min(frame_w - PAD_READY_RADIUS - 10, center_x))
+    center_y = max(PAD_READY_RADIUS + 40, min(frame_h - PAD_READY_RADIUS - 10, center_y))
+    return PadTarget(
+        center=(center_x, center_y),
+        start_radius=PAD_START_RADIUS,
+        ready_radius=PAD_READY_RADIUS,
+        grow_duration=PAD_GROW_DURATION,
+        ready_window=PAD_READY_WINDOW,
+        spawned_at=spawned_at,
+    )
+
+
 def main() -> None:
     """Run the head-dodging game."""
+    game_mode = normalize_game_mode(GAME_MODE)
+    current_stage = "dodge" if game_mode == "both" else game_mode
+    stage_started_at = time.time()
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Unable to access webcam.")
@@ -688,6 +850,8 @@ def main() -> None:
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
     attacks: List[Attack] = []
+    pad_target: Optional[PadTarget] = None
+    next_pad_spawn_time = time.time()
     spawn_interval = 1.5
     last_spawn_time = time.time()
     score = 0
@@ -700,12 +864,21 @@ def main() -> None:
     previous_gray: Optional[np.ndarray] = None
     previous_frame_time = time.perf_counter() - TARGET_FRAME_TIME
 
-    def reset_round(current_head_rect: Optional[Rect]) -> None:
-        nonlocal attacks, last_spawn_time, score, game_over, game_over_started_at
-        nonlocal last_head_rect, last_arm_rects, last_arm_segments, last_arm_seen_at, previous_gray
+    def clear_stage_elements(started_at: float) -> None:
+        nonlocal attacks, pad_target, next_pad_spawn_time, last_spawn_time
 
         attacks = []
-        last_spawn_time = time.time()
+        pad_target = None
+        next_pad_spawn_time = started_at
+        last_spawn_time = started_at
+
+    def reset_round(current_head_rect: Optional[Rect]) -> None:
+        nonlocal score, game_over, game_over_started_at, current_stage, stage_started_at
+        nonlocal last_head_rect, last_arm_rects, last_arm_segments, last_arm_seen_at, previous_gray
+
+        current_stage = "dodge" if game_mode == "both" else game_mode
+        stage_started_at = time.time()
+        clear_stage_elements(stage_started_at)
         score = 0
         game_over = False
         game_over_started_at = None
@@ -729,6 +902,15 @@ def main() -> None:
         frame = cv2.flip(frame, 1)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if game_mode == "both" and not game_over and (now - stage_started_at) >= BOTH_MODE_STAGE_DURATION:
+            current_stage = "pad_work" if current_stage == "dodge" else "dodge"
+            stage_started_at = now
+            clear_stage_elements(now)
+
+        pad_work_enabled = mode_has_pad_work(current_stage)
+        dodge_enabled = mode_has_dodge(current_stage)
+
         pose_results = None
         if pose_tracker is not None:
             if pose_tracker_backend == "solutions":
@@ -771,11 +953,20 @@ def main() -> None:
                 last_arm_rects = []
                 last_arm_segments = []
 
-        if not game_over and target_head_rect is not None and (now - last_spawn_time > spawn_interval):
+        if (
+            pad_work_enabled
+            and not game_over
+            and target_head_rect is not None
+            and pad_target is None
+            and now >= next_pad_spawn_time
+        ):
+            pad_target = create_pad_target(target_head_rect, frame_w, frame_h, now)
+
+        if dodge_enabled and not game_over and target_head_rect is not None and (now - last_spawn_time > spawn_interval):
             attacks.extend(create_attack_pattern(target_head_rect, frame_w, frame_h, now))
             last_spawn_time = now
 
-        if not game_over:
+        if dodge_enabled and not game_over:
             remaining_attacks: List[Attack] = []
             for attack in attacks:
                 attack.update(now, delta_time)
@@ -796,6 +987,21 @@ def main() -> None:
                     remaining_attacks.append(attack)
             attacks = remaining_attacks
 
+        if pad_work_enabled and not game_over and pad_target is not None:
+            if (
+                pad_target.is_ready(now)
+                and any(
+                    segment_hits_circle(arm_start, arm_end, pad_target.center, pad_target.ready_radius)
+                    for arm_start, arm_end in arm_segments
+                )
+            ):
+                score += PAD_SCORE_POINTS
+                pad_target = None
+                next_pad_spawn_time = now + PAD_RESPAWN_DELAY
+            elif pad_target.is_expired(now):
+                pad_target = None
+                next_pad_spawn_time = now + PAD_RESPAWN_DELAY
+
         if head_rect is not None:
             x, y, w, h = head_rect
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
@@ -808,6 +1014,9 @@ def main() -> None:
         for attack in attacks:
             attack.draw(frame, now)
 
+        if pad_work_enabled and not game_over and pad_target is not None:
+            pad_target.draw(frame, now)
+
         cv2.putText(
             frame,
             f"Score: {score}",
@@ -819,8 +1028,39 @@ def main() -> None:
         )
         cv2.putText(
             frame,
-            "Yellow = punch warning | Orange = live hook | Cyan guard blocks hooks",
+            f"Mode: {get_mode_label(game_mode)}",
             (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
+        if game_mode == "both":
+            stage_remaining = max(0.0, BOTH_MODE_STAGE_DURATION - (now - stage_started_at))
+            cv2.putText(
+                frame,
+                f"Stage: {get_mode_label(current_stage)} {stage_remaining:.1f}s",
+                (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+            if current_stage == "pad_work":
+                legend_text = "Yellow pad grows, then touch the blue pad with a cyan arm line"
+            else:
+                legend_text = "Yellow = warnings | Orange = live hook | Cyan = guard"
+            legend_y = 120
+        elif game_mode == "pad_work":
+            legend_text = "Yellow pad grows, then touch the blue pad with a cyan arm line"
+            legend_y = 90
+        else:
+            legend_text = "Yellow = warnings | Orange = live hook | Cyan = guard"
+            legend_y = 90
+        cv2.putText(
+            frame,
+            legend_text,
+            (10, legend_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (255, 255, 255),
@@ -830,14 +1070,14 @@ def main() -> None:
             cv2.putText(
                 frame,
                 pose_status_text or "MediaPipe pose unavailable: hook blocking off",
-                (10, 90),
+                (10, legend_y + 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (0, 0, 255),
                 2,
             )
 
-        if game_over:
+        if dodge_enabled and game_over:
             button_width = int(frame_w * 0.24)
             button_height = int(frame_h * 0.1)
             button_x = int((frame_w - button_width) / 2)
@@ -909,6 +1149,8 @@ def main() -> None:
 
         key = cv2.waitKey(1) & 0xFF
         if (
+            dodge_enabled
+            and
             AUTO_RESTART_ENABLED
             and game_over
             and game_over_started_at is not None
