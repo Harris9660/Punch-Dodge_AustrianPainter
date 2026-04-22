@@ -1,8 +1,21 @@
 from typing import Optional
 
 import cv2
+import numpy as np
 
 from game_utils import Point, Rect, blend_circle, blend_rect
+from settings import PAD_TARGET_IMAGE_PATH
+
+
+def _load_pad_target_image():
+    """Load the configured pad image once and reuse it across frames."""
+    if PAD_TARGET_IMAGE_PATH is None:
+        return None
+
+    image = cv2.imread(PAD_TARGET_IMAGE_PATH, cv2.IMREAD_UNCHANGED)
+    if image is None or image.size == 0:
+        return None
+    return image
 
 
 class Attack:
@@ -229,6 +242,9 @@ class HookAttack(Attack):
 class PadTarget:
     """A timed pad target that grows, becomes live, then expires if not hit."""
 
+    _cached_image = None
+    _image_load_attempted = False
+
     def __init__(
         self,
         center: Point,
@@ -259,17 +275,76 @@ class PadTarget:
     def is_expired(self, now: float) -> bool:
         return (now - self.spawned_at) >= (self.grow_duration + self.ready_window)
 
+    @classmethod
+    def get_pad_image(cls):
+        """Cache the optional pad image so we do not decode it every frame."""
+        if not cls._image_load_attempted:
+            cls._cached_image = _load_pad_target_image()
+            cls._image_load_attempted = True
+        return cls._cached_image
+
+    def draw_pad_image(self, frame, current_radius: int) -> bool:
+        """Draw the pad image clipped to the current circular target area."""
+        pad_image = self.get_pad_image()
+        if pad_image is None or current_radius <= 0:
+            return False
+
+        diameter = max(2, current_radius * 2)
+        interpolation = cv2.INTER_AREA if diameter <= max(pad_image.shape[:2]) else cv2.INTER_LINEAR
+        resized = cv2.resize(pad_image, (diameter, diameter), interpolation=interpolation)
+
+        x = self.center[0] - current_radius
+        y = self.center[1] - current_radius
+        frame_h, frame_w = frame.shape[:2]
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(frame_w, x + diameter)
+        y2 = min(frame_h, y + diameter)
+        if x1 >= x2 or y1 >= y2:
+            return False
+
+        # Clip the resized image to the frame so partially off-screen pads still render cleanly.
+        cropped_image = resized[y1 - y : y2 - y, x1 - x : x2 - x]
+        circle_mask = np.zeros((diameter, diameter), dtype=np.uint8)
+        cv2.circle(circle_mask, (diameter // 2, diameter // 2), max(1, current_radius - 1), 255, -1)
+        cropped_mask = circle_mask[y1 - y : y2 - y, x1 - x : x2 - x].astype(np.float32) / 255.0
+
+        if cropped_image.ndim == 2:
+            image_rgb = cv2.cvtColor(cropped_image, cv2.COLOR_GRAY2BGR).astype(np.float32)
+            image_alpha = cropped_mask
+        elif cropped_image.shape[2] == 4:
+            image_rgb = cropped_image[:, :, :3].astype(np.float32)
+            image_alpha = (cropped_image[:, :, 3].astype(np.float32) / 255.0) * cropped_mask
+        else:
+            image_rgb = cropped_image[:, :, :3].astype(np.float32)
+            image_alpha = cropped_mask
+
+        roi = frame[y1:y2, x1:x2].astype(np.float32)
+        alpha = image_alpha[:, :, None]
+        blended = image_rgb * alpha + roi * (1.0 - alpha)
+        frame[y1:y2, x1:x2] = blended.astype(np.uint8)
+        return True
+
     def draw(self, frame, now: float) -> None:
         current_radius = self.get_current_radius(now)
         ready = self.is_ready(now)
         pad_color = (255, 0, 0) if ready else (0, 215, 255)
         cx, cy = self.center
 
-        blend_circle(frame, self.center, current_radius, pad_color, 0.22 if ready else 0.16)
-        cv2.circle(frame, self.center, current_radius, pad_color, 3)
-        cv2.circle(frame, self.center, max(5, current_radius // 4), pad_color, -1)
+        if self.get_pad_image() is not None:
+            blend_circle(frame, self.center, current_radius, pad_color, 0.14 if ready else 0.1)
+            if self.draw_pad_image(frame, current_radius):
+                cv2.circle(frame, self.center, current_radius, pad_color, 3)
+            else:
+                blend_circle(frame, self.center, current_radius, pad_color, 0.22 if ready else 0.16)
+                cv2.circle(frame, self.center, current_radius, pad_color, 3)
+                cv2.circle(frame, self.center, max(5, current_radius // 4), pad_color, -1)
+        else:
+            blend_circle(frame, self.center, current_radius, pad_color, 0.22 if ready else 0.16)
+            cv2.circle(frame, self.center, current_radius, pad_color, 3)
+            cv2.circle(frame, self.center, max(5, current_radius // 4), pad_color, -1)
 
-        label_y = max(30, cy - self.ready_radius - 12)
+        label_y = max(40, cy - self.ready_radius - 34)
         label_x = max(10, min(cx - 70, frame.shape[1] - 180))
         cv2.putText(
             frame,

@@ -26,17 +26,18 @@ AUTO_RESTART_ENABLED = True
 AUTO_RESTART_DELAY = 1.0
 
 # "pad_work", "dodge", "both"
-GAME_MODE = "dodge"
+GAME_MODE = "both"
 BOTH_MODE_STAGE_DURATION = 10.0
 
 PAD_SCORE_POINTS = 2
-PAD_RESPAWN_DELAY = 0.7
+PAD_RESPAWN_DELAY = 1.2
 PAD_START_RADIUS = 12
 PAD_READY_RADIUS = 42
 PAD_GROW_DURATION = 0.45
 PAD_READY_WINDOW = 1.0
 PAD_HEAD_SIDE_OFFSET_RATIO = 0.1
 
+JAB_WARNING_DURATION = 0.7
 JAB_ACTIVE_DURATION = 0.01
 STRAIGHT_SIDE_HEAD_OFFSET_RATIO = 0.25
 
@@ -75,6 +76,11 @@ POSE_VISIBILITY_THRESHOLD = 0.5
 POSE_LANDMARKER_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "pose_landmarker_lite.task")
 if not os.path.exists(POSE_LANDMARKER_MODEL_PATH):
     POSE_LANDMARKER_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "pose_landmarker.task")
+
+ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
+PAD_TARGET_IMAGE_PATH = os.path.join(ASSETS_DIR, "Adolf-Hitler-1933.jpg.webp")
+if not os.path.exists(PAD_TARGET_IMAGE_PATH):
+    PAD_TARGET_IMAGE_PATH = None
 
 
 def normalize_game_mode(game_mode: str) -> str:
