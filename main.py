@@ -35,13 +35,13 @@ ArmSegment = Tuple[Point, Point]
 
 
 WINDOW_NAME = "Head Dodge Game"
-FULLSCREEN_WINDOW = False
+FULLSCREEN_WINDOW = True
 TARGET_FPS = 60
 TARGET_FRAME_TIME = 1.0 / TARGET_FPS
 AUTO_RESTART_ENABLED = True
 AUTO_RESTART_DELAY = 1.0
 # "pad_work", "dodge", "both"
-GAME_MODE = "both"
+GAME_MODE = "dodge"
 BOTH_MODE_STAGE_DURATION = 10.0
 PAD_SCORE_POINTS = 2
 PAD_RESPAWN_DELAY = 0.7
@@ -49,11 +49,8 @@ PAD_START_RADIUS = 12
 PAD_READY_RADIUS = 42
 PAD_GROW_DURATION = 0.45
 PAD_READY_WINDOW = 1.0
-PAD_HEAD_SIDE_OFFSET_RATIO = 0.5
-JAB_BOX_WIDTH = 100
-JAB_BOX_HEIGHT = 100
-JAB_WARNING_DURATION = 0.75
-JAB_ACTIVE_DURATION = 0.18
+PAD_HEAD_SIDE_OFFSET_RATIO = 0.1
+JAB_ACTIVE_DURATION = 0.01
 STRAIGHT_SIDE_HEAD_OFFSET_RATIO = 0.25
 HOOK_WIDTH = 280
 HOOK_HEIGHT = 40
@@ -61,8 +58,9 @@ HOOK_WARNING_DURATION = 0.35
 HOOK_WARNING_WIDTH = 100
 HOOK_WARNING_HEAD_GAP = 18
 COMBO_STEP_DELAY = 0.38
-ARM_BLOCK_PADDING = 20
-ARM_DRAW_THICKNESS = 6
+ARM_BLOCK_LENGTH_PADDING = 24
+ARM_BLOCK_THICKNESS = 56
+ARM_DRAW_THICKNESS = 8
 ARM_GUARD_TOP_MULTIPLIER = 0.7
 ARM_GUARD_BOTTOM_MULTIPLIER = 1.0
 ARM_MEMORY_SECONDS = 0.12
@@ -140,27 +138,37 @@ class Attack:
 
 
 class JabAttack(Attack):
-    """A jab shows a warning box before it becomes dangerous."""
+    """A jab grows toward the face before becoming dangerous."""
 
     def __init__(
         self,
-        x: int,
-        y: int,
-        width: int,
-        height: int,
-        warning_duration: float,
+        center: Point,
+        start_radius: int,
+        strike_radius: int,
+        grow_duration: float,
         active_duration: float,
         start_time: float,
         label: str = "JAB",
     ):
-        self.rect = (x, y, width, height)
-        self.warning_duration = warning_duration
+        self.center = center
+        self.start_radius = start_radius
+        self.strike_radius = strike_radius
+        self.grow_duration = grow_duration
         self.active_duration = active_duration
         self.activation_time = start_time
         self.label = label
         self.state = "queued"
         self.state_started_at = 0.0
         self.finished = False
+
+    def get_current_radius(self, now: float) -> int:
+        """Grow from the pad-work start size into the live jab size."""
+        elapsed = max(0.0, now - self.state_started_at)
+        if elapsed >= self.grow_duration:
+            return self.strike_radius
+        progress = elapsed / max(self.grow_duration, 0.001)
+        radius = self.start_radius + (self.strike_radius - self.start_radius) * progress
+        return int(round(radius))
 
     def update(self, now: float, delta_time: float) -> None:
         del delta_time
@@ -175,7 +183,7 @@ class JabAttack(Attack):
             return
 
         elapsed = now - self.state_started_at
-        if self.state == "warning" and elapsed >= self.warning_duration:
+        if self.state == "warning" and elapsed >= self.grow_duration:
             self.state = "strike"
             self.state_started_at = now
         elif self.state == "strike" and elapsed >= self.active_duration:
@@ -185,32 +193,35 @@ class JabAttack(Attack):
         if self.state == "queued":
             return
 
-        x, y, w, h = self.rect
+        cx, cy = self.center
         overlay = frame.copy()
 
         if self.state == "warning":
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 215, 255), -1)
+            radius = self.get_current_radius(now)
+            cv2.circle(overlay, self.center, radius, (0, 215, 255), -1)
             cv2.addWeighted(overlay, 0.22, frame, 0.78, 0, frame)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 215, 255), 3)
+            cv2.circle(frame, self.center, radius, (0, 215, 255), 3)
+            cv2.circle(frame, self.center, max(5, radius // 4), (0, 215, 255), -1)
 
-            remaining = max(0.0, self.warning_duration - (now - self.state_started_at))
+            remaining = max(0.0, self.grow_duration - (now - self.state_started_at))
             cv2.putText(
                 frame,
                 f"{self.label} IN {remaining:.1f}",
-                (x, max(30, y - 10)),
+                (max(10, min(cx - 85, frame.shape[1] - 190)), max(30, cy - self.strike_radius - 12)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 215, 255),
                 2,
             )
         else:
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 255), -1)
+            cv2.circle(overlay, self.center, self.strike_radius, (0, 0, 255), -1)
             cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            cv2.circle(frame, self.center, self.strike_radius, (0, 0, 255), 3)
+            cv2.circle(frame, self.center, max(5, self.strike_radius // 4), (0, 0, 255), -1)
             cv2.putText(
                 frame,
                 "MOVE!",
-                (x, max(30, y - 10)),
+                (max(10, min(cx - 45, frame.shape[1] - 100)), max(30, cy - self.strike_radius - 12)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
                 (0, 0, 255),
@@ -219,7 +230,9 @@ class JabAttack(Attack):
 
     def get_hit_rect(self) -> Optional[Rect]:
         if self.state == "strike" and not self.finished:
-            return self.rect
+            cx, cy = self.center
+            diameter = self.strike_radius * 2
+            return cx - self.strike_radius, cy - self.strike_radius, diameter, diameter
         return None
 
     def is_finished(self, frame_w: int, frame_h: int) -> bool:
@@ -413,10 +426,8 @@ def create_jab_attack(
     side: str = "center",
     label: str = "JAB",
 ) -> JabAttack:
-    """Create a telegraphed straight punch near the player's current head position."""
+    """Create a telegraphed straight punch aimed at the player's face."""
     head_x, head_y, head_w, head_h = head_rect
-    width = min(frame_w, JAB_BOX_WIDTH)
-    height = min(frame_h, JAB_BOX_HEIGHT)
     side_offset = int(head_w * STRAIGHT_SIDE_HEAD_OFFSET_RATIO)
     if side == "center":
         center_x = head_x + head_w // 2
@@ -427,15 +438,15 @@ def create_jab_attack(
     else:
         raise ValueError(f"Unsupported straight punch side: {side}")
     center_y = head_y + head_h // 2
-    x = max(0, min(frame_w - width, center_x - width // 2))
-    y = max(0, min(frame_h - height, center_y - height // 2))
+    strike_radius = min(PAD_READY_RADIUS, frame_w // 2, frame_h // 2)
+    center_x = max(strike_radius, min(frame_w - strike_radius, center_x))
+    center_y = max(strike_radius, min(frame_h - strike_radius, center_y))
 
     return JabAttack(
-        x=x,
-        y=y,
-        width=width,
-        height=height,
-        warning_duration=JAB_WARNING_DURATION,
+        center=(center_x, center_y),
+        start_radius=PAD_START_RADIUS,
+        strike_radius=strike_radius,
+        grow_duration=PAD_GROW_DURATION,
         active_duration=JAB_ACTIVE_DURATION,
         start_time=start_time,
         label=label,
@@ -657,13 +668,36 @@ def get_pose_landmarks(pose_results):
     return None
 
 
-def segment_to_rect(start: Point, end: Point, padding: int, frame_w: int, frame_h: int) -> Rect:
-    """Expand a line segment into a blocking rectangle."""
-    x = min(start[0], end[0]) - padding
-    y = min(start[1], end[1]) - padding
-    width = abs(start[0] - end[0]) + padding * 2
-    height = abs(start[1] - end[1]) + padding * 2
-    return clamp_rect(x, y, width, height, frame_w, frame_h)
+def expand_block_rect(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    frame_w: int,
+    frame_h: int,
+) -> Rect:
+    """Inflate a blocking area into a wider, more rectangular guard zone."""
+    x -= ARM_BLOCK_LENGTH_PADDING
+    y -= ARM_BLOCK_LENGTH_PADDING
+    width += ARM_BLOCK_LENGTH_PADDING * 2
+    height += ARM_BLOCK_LENGTH_PADDING * 2
+
+    center_x = x + width / 2.0
+    center_y = y + height / 2.0
+    width = max(width, ARM_BLOCK_THICKNESS)
+    height = max(height, ARM_BLOCK_THICKNESS)
+    x = int(round(center_x - width / 2.0))
+    y = int(round(center_y - height / 2.0))
+    return clamp_rect(x, y, int(width), int(height), frame_w, frame_h)
+
+
+def segment_to_rect(start: Point, end: Point, frame_w: int, frame_h: int) -> Rect:
+    """Expand a line segment into a wider rectangular blocking area."""
+    x = min(start[0], end[0])
+    y = min(start[1], end[1])
+    width = abs(start[0] - end[0])
+    height = abs(start[1] - end[1])
+    return expand_block_rect(x, y, width, height, frame_w, frame_h)
 
 
 def detect_arm_blocks(pose_results, head_rect: Rect, frame_w: int, frame_h: int) -> Tuple[List[Rect], List[ArmSegment]]:
@@ -697,7 +731,7 @@ def detect_arm_blocks(pose_results, head_rect: Rect, frame_w: int, frame_h: int)
             continue
 
         arm_segments.append((elbow_point, palm_point))
-        arm_rects.append(segment_to_rect(elbow_point, palm_point, ARM_BLOCK_PADDING, frame_w, frame_h))
+        arm_rects.append(segment_to_rect(elbow_point, palm_point, frame_w, frame_h))
 
     return arm_rects, arm_segments
 
@@ -739,11 +773,11 @@ def detect_arm_blocks_fallback(
 
         contour = max(candidates, key=cv2.contourArea)
         rect_x, rect_y, rect_w, rect_h = cv2.boundingRect(contour)
-        padded_rect = clamp_rect(
-            x + rect_x - ARM_BLOCK_PADDING,
-            y + rect_y - ARM_BLOCK_PADDING,
-            rect_w + ARM_BLOCK_PADDING * 2,
-            rect_h + ARM_BLOCK_PADDING * 2,
+        padded_rect = expand_block_rect(
+            x + rect_x,
+            y + rect_y,
+            rect_w,
+            rect_h,
             frame_w,
             frame_h,
         )
@@ -972,7 +1006,7 @@ def main() -> None:
                 attack.update(now, delta_time)
                 hit_rect = attack.get_hit_rect()
 
-                if isinstance(attack, HookAttack) and hit_rect is not None:
+                if isinstance(attack, (JabAttack, HookAttack)) and hit_rect is not None:
                     if any(intersects(arm_rect, hit_rect) for arm_rect in arm_rects):
                         continue
 
@@ -1049,13 +1083,13 @@ def main() -> None:
             if current_stage == "pad_work":
                 legend_text = "Yellow pad grows, then touch the blue pad with a cyan arm line"
             else:
-                legend_text = "Yellow = warnings | Orange = live hook | Cyan = guard"
+                legend_text = "Yellow = warnings | Cyan guard blocks jabs/hooks | Orange = live hook"
             legend_y = 120
         elif game_mode == "pad_work":
             legend_text = "Yellow pad grows, then touch the blue pad with a cyan arm line"
             legend_y = 90
         else:
-            legend_text = "Yellow = warnings | Orange = live hook | Cyan = guard"
+            legend_text = "Yellow = warnings | Cyan guard blocks jabs/hooks | Orange = live hook"
             legend_y = 90
         cv2.putText(
             frame,
